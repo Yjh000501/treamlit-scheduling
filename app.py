@@ -1,45 +1,54 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-from ortools.sat.python import cp_model
 import plotly.graph_objects as go
+from ortools.sat.python import cp_model
 
 
 # =========================================================
-# 求解函数：单机调度 1 | r_i | Cmax
+# 求解函数 1：自动优化顺序（两阶段流水车间）
 # =========================================================
-def solve_single_machine_schedule(wait_times, process_times, time_limit=30):
+def solve_flow_shop(wait_times, process_times, time_limit=30):
     n = len(wait_times)
     assert n == len(process_times)
 
-    horizon = max(wait_times) + sum(process_times)
-
+    horizon = sum(wait_times) + sum(process_times)
     model = cp_model.CpModel()
 
-    start = [model.NewIntVar(wait_times[i], horizon, f"start_{i}") for i in range(n)]
-    end = [model.NewIntVar(0, horizon, f"end_{i}") for i in range(n)]
-    interval = [
-        model.NewIntervalVar(start[i], process_times[i], end[i], f"interval_{i}")
+    ws = [model.NewIntVar(0, horizon, f"ws_{i}") for i in range(n)]
+    we = [model.NewIntVar(0, horizon, f"we_{i}") for i in range(n)]
+    ps = [model.NewIntVar(0, horizon, f"ps_{i}") for i in range(n)]
+    pe = [model.NewIntVar(0, horizon, f"pe_{i}") for i in range(n)]
+
+    wait_interval = [
+        model.NewIntervalVar(ws[i], wait_times[i], we[i], f"wait_{i}")
         for i in range(n)
     ]
+    proc_interval = [
+        model.NewIntervalVar(ps[i], process_times[i], pe[i], f"proc_{i}")
+        for i in range(n)
+    ]
+
+    model.AddNoOverlap(wait_interval)
+    model.AddNoOverlap(proc_interval)
+
+    for i in range(n):
+        model.Add(we[i] <= ps[i])
 
     rank = [model.NewIntVar(0, n - 1, f"rank_{i}") for i in range(n)]
     model.AddAllDifferent(rank)
 
-    model.AddNoOverlap(interval)
-
-    before = {}
     for i in range(n):
         for j in range(i + 1, n):
             b = model.NewBoolVar(f"before_{i}_{j}")
-            before[(i, j)] = b
             model.Add(rank[i] < rank[j]).OnlyEnforceIf(b)
             model.Add(rank[j] < rank[i]).OnlyEnforceIf(b.Not())
-            model.Add(end[i] <= start[j]).OnlyEnforceIf(b)
-            model.Add(end[j] <= start[i]).OnlyEnforceIf(b.Not())
+            model.Add(we[i] <= ws[j]).OnlyEnforceIf(b)
+            model.Add(we[j] <= ws[i]).OnlyEnforceIf(b.Not())
+            model.Add(pe[i] <= ps[j]).OnlyEnforceIf(b)
+            model.Add(pe[j] <= ps[i]).OnlyEnforceIf(b.Not())
 
     makespan = model.NewIntVar(0, horizon, "makespan")
-    model.AddMaxEquality(makespan, end)
+    model.AddMaxEquality(makespan, pe)
     model.Minimize(makespan)
 
     solver = cp_model.CpSolver()
@@ -47,7 +56,6 @@ def solve_single_machine_schedule(wait_times, process_times, time_limit=30):
     solver.parameters.num_search_workers = 8
 
     status = solver.Solve(model)
-
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return None
 
@@ -59,8 +67,10 @@ def solve_single_machine_schedule(wait_times, process_times, time_limit=30):
             "板坯": f"板坯 {i + 1}",
             "待温时间(s)": wait_times[i],
             "精轧时间(s)": process_times[i],
-            "开始精轧(s)": solver.Value(start[i]),
-            "结束精轧(s)": solver.Value(end[i]),
+            "待温开始(s)": solver.Value(ws[i]),
+            "待温结束(s)": solver.Value(we[i]),
+            "精轧开始(s)": solver.Value(ps[i]),
+            "精轧结束(s)": solver.Value(pe[i]),
         })
 
     return {
@@ -71,28 +81,80 @@ def solve_single_machine_schedule(wait_times, process_times, time_limit=30):
 
 
 # =========================================================
-# 页面配置
+# 求解函数 2：固定顺序（线性递推）
+# =========================================================
+def solve_fixed_order_flow_shop(wait_times, process_times, order):
+    n = len(wait_times)
+    assert len(order) == n
+    assert sorted(order) == list(range(n)), "顺序必须包含所有板坯且不重复"
+
+    rows = []
+    prev_we = 0
+    prev_pe = 0
+
+    for pos, i in enumerate(order, start=1):
+        w = wait_times[i]
+        p = process_times[i]
+
+        ws = prev_we
+        we = ws + w
+        ps = max(we, prev_pe)
+        pe = ps + p
+
+        rows.append({
+            "顺序": pos,
+            "板坯": f"板坯 {i + 1}",
+            "待温时间(s)": w,
+            "精轧时间(s)": p,
+            "待温开始(s)": ws,
+            "待温结束(s)": we,
+            "精轧开始(s)": ps,
+            "精轧结束(s)": pe,
+        })
+
+        prev_we = we
+        prev_pe = pe
+
+    return {
+        "status": "FIXED_ORDER",
+        "makespan": prev_pe,
+        "table": pd.DataFrame(rows),
+    }
+
+
+# =========================================================
+# 页面
 # =========================================================
 st.set_page_config(page_title="板坯待温-精轧协同排产", layout="wide")
 st.title("板坯待温-精轧协同排产")
-st.caption("输入每块板坯的待温时间和精轧时间，系统自动求解最小 makespan 的最优排产顺序。")
+st.caption("待温顺序 = 精轧顺序，两阶段流水车间，最小化总完工时间。")
 
-# =========================================================
-# 输入区
-# =========================================================
 st.sidebar.header("参数设置")
-
 n = st.sidebar.number_input("板坯数量", min_value=1, max_value=50, value=10, step=1)
-time_limit = st.sidebar.number_input("求解时间上限（秒）", min_value=1, max_value=300, value=30, step=1)
+time_limit = st.sidebar.number_input(
+    "求解时间上限（秒）", min_value=1, max_value=300, value=30, step=1
+)
+
+st.sidebar.markdown("---")
+st.sidebar.header("排产模式")
+mode = st.sidebar.radio("选择模式", ["自动优化顺序", "固定顺序"], index=0)
+
+fixed_order_str = None
+if mode == "固定顺序":
+    st.sidebar.markdown("**输入固定顺序**")
+    st.sidebar.caption("用逗号分隔，例如：3,1,5,2,4,6,7,8,9,10")
+    default_order_str = ",".join(str(i + 1) for i in range(n))
+    fixed_order_str = st.sidebar.text_input("板坯顺序", value=default_order_str)
 
 st.subheader("1. 输入板坯数据")
 
 default_wait = [70, 150, 230, 310, 390, 470, 550, 630, 710, 770]
 default_proc = [120, 90, 150, 110, 130, 100, 140, 95, 160, 105]
 
-# 保证默认数据长度足够
+
 def get_default(lst, i, fallback):
     return lst[i] if i < len(lst) else fallback
+
 
 input_data = []
 cols = st.columns([1, 2, 2])
@@ -104,26 +166,49 @@ for i in range(n):
     c0, c1, c2 = st.columns([1, 2, 2])
     c0.write(f"板坯 {i + 1}")
     w = c1.number_input(
-        f"待温时间_{i}", min_value=0, value=int(get_default(default_wait, i, 100)),
-        step=10, key=f"w_{i}"
+        f"待温时间_{i}", min_value=0,
+        value=int(get_default(default_wait, i, 100)), step=10, key=f"w_{i}"
     )
     p = c2.number_input(
-        f"精轧时间_{i}", min_value=1, value=int(get_default(default_proc, i, 120)),
-        step=10, key=f"p_{i}"
+        f"精轧时间_{i}", min_value=1,
+        value=int(get_default(default_proc, i, 120)), step=10, key=f"p_{i}"
     )
     input_data.append((w, p))
 
-# =========================================================
-# 求解
-# =========================================================
 st.subheader("2. 求解结果")
 
 if st.button("开始排产"):
     wait_times = [x[0] for x in input_data]
     process_times = [x[1] for x in input_data]
 
-    with st.spinner("正在求解最优排产顺序..."):
-        result = solve_single_machine_schedule(wait_times, process_times, time_limit=time_limit)
+    if mode == "固定顺序":
+        try:
+            order_1based = [
+                int(x.strip()) for x in fixed_order_str.split(",") if x.strip()
+            ]
+        except ValueError:
+            st.error("顺序格式不对，请用逗号分隔的数字，例如：3,1,5,2,4")
+            st.stop()
+
+        if len(order_1based) != n:
+            st.error(f"顺序长度应为 {n}，当前为 {len(order_1based)}")
+            st.stop()
+
+        if sorted(order_1based) != list(range(1, n + 1)):
+            st.error("顺序必须是 1 到 n 的一个排列，不能重复或遗漏")
+            st.stop()
+
+        order_0based = [x - 1 for x in order_1based]
+
+        with st.spinner("正在按固定顺序计算..."):
+            result = solve_fixed_order_flow_shop(
+                wait_times, process_times, order_0based
+            )
+    else:
+        with st.spinner("正在求解最优排产顺序..."):
+            result = solve_flow_shop(
+                wait_times, process_times, time_limit=time_limit
+            )
 
     if result is None:
         st.error("未找到可行解，请检查输入数据。")
@@ -133,40 +218,47 @@ if st.button("开始排产"):
         col1.metric("最小总完工时间 makespan", f"{result['makespan']} s")
         col2.metric("板坯数量", n)
 
-        st.markdown("### 最优排产顺序")
+        st.markdown("### 排产顺序")
         st.dataframe(result["table"])
 
-        import plotly.graph_objects as go
-
-        st.markdown("### 精轧机时间线（甘特图）")
+        st.markdown("### 待温 + 精轧 时间线")
 
         df = result["table"].copy()
-        df["持续"] = df["结束精轧(s)"] - df["开始精轧(s)"]
-
         fig = go.Figure()
 
         for _, row in df.iterrows():
             fig.add_trace(go.Bar(
-                x=[row["持续"]],
+                x=[row["待温时间(s)"]],
                 y=[row["板坯"]],
-                base=[row["开始精轧(s)"]],
+                base=[row["待温开始(s)"]],
                 orientation="h",
-                name=row["板坯"],
-                text=f"顺序 {row['顺序']}｜{row['开始精轧(s)']}→{row['结束精轧(s)']}s",
+                name="待温",
+                marker_color="lightblue",
+                text=f"待温 {row['待温开始(s)']}→{row['待温结束(s)']}s",
                 textposition="inside",
                 hoverinfo="text",
+                showlegend=False,
+            ))
+            fig.add_trace(go.Bar(
+                x=[row["精轧时间(s)"]],
+                y=[row["板坯"]],
+                base=[row["精轧开始(s)"]],
+                orientation="h",
+                name="精轧",
+                marker_color="salmon",
+                text=f"精轧 {row['精轧开始(s)']}→{row['精轧结束(s)']}s",
+                textposition="inside",
+                hoverinfo="text",
+                showlegend=False,
             ))
 
         fig.update_layout(
-            barmode="stack",
+            barmode="overlay",
             xaxis_title="时间 (s)",
             yaxis_title="板坯",
-            showlegend=False,
             height=400,
             margin=dict(l=80, r=40, t=40, b=40),
         )
-
-        # 让 y 轴按排产顺序从上到下显示
         fig.update_yaxes(
             categoryorder="array",
             categoryarray=list(df["板坯"])[::-1],
@@ -174,7 +266,6 @@ if st.button("开始排产"):
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # 下载结果
         csv = result["table"].to_csv(index=False).encode("utf-8-sig")
         st.download_button(
             "下载排产结果 CSV",
